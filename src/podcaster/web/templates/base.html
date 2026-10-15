@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}GUMU-GUMU / PODCASTER{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="glow"></div>
+  <header class="shell nav">
+    <a class="brand" href="/">GUMU-GUMU <span>/ PODCASTER</span></a>
+    <nav><a href="/">Jobs</a><a href="#sources">Sources</a><a href="#review">Review</a><a href="#episodes">Episodes</a><a href="#diagnostics">Diagnostics</a></nav>
+  </header>
+  <main class="shell">{% block content %}{% endblock %}</main>
+</body>
+</html>

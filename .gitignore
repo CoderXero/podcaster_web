@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.sqlite3-*
+*.egg-info/
+.pytest_cache/
+config.yaml
+.env
+.env.*
+!.env.example

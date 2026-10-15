@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · GUMU-GUMU / PODCASTER{% endblock %}
+{% block content %}
+<section class="hero"><p class="eyebrow">OPERATOR CONSOLE</p><h1>Make the next episode<br><em>worth pressing play.</em></h1><p class="lede">A careful workspace for turning trusted Markdown into reviewable, publishable audio.</p></section>
+<section class="stats"><div><span>ALL JOBS</span><strong>{{ total }}</strong></div><div><span>LIVE WORKER</span><strong class="ok">READY</strong></div><div><span>REMOTE PUBLISH</span><strong class="warn">CONTRACT GATED</strong></div></section>
+<section class="card"><div class="section-head"><div><p class="eyebrow">RECENT WORK</p><h2>Pipeline jobs</h2></div><span class="mono">{{ total }} total</span></div>
+{% if jobs %}<div class="table">{% for job in jobs %}<a class="row" href="/jobs/{{ job.job_id }}"><div><strong>{{ job.title or job.slug }}</strong><small>{{ job.relative_path }}</small></div><div class="stage"><span class="pill {{ job.status }}">{{ job.status|replace('_',' ') }}</span><small>{{ job.pipeline_stage }}</small></div><div class="arrow">→</div></a>{% endfor %}</div>{% else %}<div class="empty">No jobs yet. Configure a source folder and scan it to begin.</div>{% endif %}</section>
+{% endblock %}

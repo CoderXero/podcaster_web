@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}{{ job.title or job.slug }} · Podcaster{% endblock %}
+{% block content %}
+<a class="back" href="/">← All jobs</a><section class="job-head"><div><p class="eyebrow">{{ job.slug }}</p><h1>{{ job.title or job.slug }}</h1><p class="lede">{{ job.current_operation }}</p></div><span class="pill {{ job.status }}">{{ job.status|replace('_',' ') }}</span></section>
+<section class="timeline card"><div class="section-head"><h2>Stage timeline</h2><span class="mono">{{ job.pipeline_stage }}</span></div><div class="track"><div class="track-fill"></div></div><p class="muted">Progress {{ job.progress.completed }} / {{ job.progress.total }} · Updated {{ job.updated_at }}</p></section>
+<section class="card"><div class="section-head"><h2>Operator actions</h2><span class="mono">{{ job.job_id }}</span></div><p class="muted">Review and publish actions are authenticated and intentionally explicit. Live updates arrive through the job event stream.</p></section>
+{% endblock %}
