@@ -157,6 +157,48 @@ class JobService:
         self.repo.append_event(job_id, "cancel_requested", "Cancellation requested", stage=job["pipeline_stage"])
         return self.get(job_id)
 
+    def continue_job(self, job_id: str, principal: Any) -> dict[str, Any]:
+        """Resume the next safe local stage, or approve a script awaiting review."""
+        job = self.repo.get_job(job_id)
+        if not job:
+            raise APIError(404, "NOT_FOUND", "Job not found.")
+        stage = job["pipeline_stage"]
+        if stage == PipelineStage.AWAITING_APPROVAL.value:
+            if not job.get("script"):
+                raise APIError(409, "SCRIPT_NOT_READY", "A generated script is not available yet.")
+            return self.approve_script(job_id, job["revision"], principal)
+        if stage in {PipelineStage.RECONCILIATION_REQUIRED.value, PipelineStage.DRAFT_CREATING.value,
+                     PipelineStage.PUBLISH_REQUESTED.value}:
+            raise APIError(409, "RECONCILIATION_REQUIRED", "Reconcile the remote outcome before continuing this job.")
+        if stage in {PipelineStage.AUDIO_READY.value, PipelineStage.DRAFT_CREATED.value,
+                     PipelineStage.UPLOADED.value, PipelineStage.PUBLISHED_VERIFIED.value,
+                     PipelineStage.ARCHIVED.value}:
+            raise APIError(409, "EXPLICIT_ACTION_REQUIRED", "This job is complete for its current stage; use the job page for the next explicit action.")
+        if stage == PipelineStage.CANCELLED.value:
+            return self.retry(job_id, "script")
+        if stage in {PipelineStage.SCRIPT_APPROVED.value, PipelineStage.SOURCE_DISCOVERED.value,
+                     PipelineStage.SCRIPT_GENERATING.value, PipelineStage.AUDIO_GENERATING.value,
+                     PipelineStage.AUDIO_PACKAGING.value}:
+            self.repo.update_job(job_id, status="queued", safe_to_retry=True, cancel_requested=False,
+                                 error_code=None, error_message=None, current_operation="Continuing job")
+            self.repo.append_event(job_id, "continue_requested", "Job continuation requested", stage=stage)
+            if self._worker:
+                self._worker.wake()
+            return self.get(job_id)
+        if job["status"] in {"failed", "cancelled"}:
+            if stage in {PipelineStage.SCRIPT_APPROVED.value, PipelineStage.AUDIO_GENERATING.value,
+                         PipelineStage.AUDIO_PACKAGING.value}:
+                return self.retry(job_id, "audio")
+            if stage in {PipelineStage.SOURCE_DISCOVERED.value, PipelineStage.SCRIPT_GENERATING.value,
+                         PipelineStage.AWAITING_APPROVAL.value}:
+                return self.retry(job_id, "script")
+            raise APIError(409, "EXPLICIT_ACTION_REQUIRED", "This failed job needs stage-specific review before it can continue.")
+        if job["status"] in {"queued", "running"}:
+            if self._worker:
+                self._worker.wake()
+            return self.get(job_id)
+        raise APIError(409, "INVALID_STATE", "This job cannot be continued from its current state.")
+
     def delete_queued_job(self, job_id: str) -> dict[str, Any]:
         job = self.repo.get_job(job_id)
         if not job:
@@ -343,4 +385,6 @@ class JobService:
                              manifest_json=manifest, safe_to_retry=True, current_operation="Approved; queued")
         self.repo.append_event(job_id, "script_approved", "Script approved", stage=PipelineStage.SCRIPT_APPROVED.value,
                                payload={"revision": revision, "content_hash": content_hash, "approved_by": principal.user_id})
+        if self._worker:
+            self._worker.wake()
         return self.get(job_id)

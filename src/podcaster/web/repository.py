@@ -134,6 +134,12 @@ class Repository:
             cursor = db.execute("DELETE FROM jobs WHERE job_id=? AND status='queued'", (job_id,))
             return cursor.rowcount == 1
 
+    def purge_jobs(self) -> int:
+        """Remove every indexed job and its events, preserving filesystem artifacts."""
+        with self._lock, self._connect() as db:
+            cursor = db.execute("DELETE FROM jobs")
+            return cursor.rowcount
+
     def cancel_queued_job(self, job_id: str) -> bool:
         """Cancel atomically before a worker can claim the queued job."""
         with self._lock, self._connect() as db:
@@ -189,4 +195,5 @@ class Repository:
             return self._decode(db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone())
 
     def release_lease(self, job_id: str) -> None:
-        self.update_job(job_id, lease_until=None, worker_id=None)
+        with self._lock, self._connect() as db:
+            db.execute("UPDATE jobs SET lease_until=NULL, worker_id=NULL, updated_at=? WHERE job_id=?", (now_iso(), job_id))

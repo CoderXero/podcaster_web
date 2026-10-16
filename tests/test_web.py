@@ -55,6 +55,12 @@ def test_scan_review_and_stale_approval(tmp_path: Path):
                 break
             time.sleep(0.02)
         assert job["pipeline_stage"] == "AWAITING_APPROVAL"
+        review_page = client.get(f"/jobs/{job_id}")
+        assert 'id="approve-script"' in review_page.text
+        assert 'Approve script &amp; continue' in review_page.text
+        assert str(tmp_path / "articles" / "story.md") in review_page.text
+        dashboard = client.get("/")
+        assert 'data-continue-job="' in dashboard.text
         script = client.get(f"/api/v1/jobs/{job_id}/script").json()
         edited = script["script"] | {"title": "Edited"}
         assert client.patch(f"/api/v1/jobs/{job_id}/script", json={"revision": 1, "script": edited}).status_code == 200
@@ -82,6 +88,12 @@ def test_dashboard_starts_a_run_with_per_run_voice_ids(tmp_path: Path):
         assert 'id="source-root"' in page.text
         assert 'id="voice-host"' in page.text
         assert 'id="voice-guest"' in page.text
+        assert 'value="awaiting_approval"' in page.text
+        assert 'value="audio"' in page.text
+        assert 'value="draft"' in page.text
+        assert 'value="published"' in page.text
+        assert 'id="archive-source"' in page.text
+        assert 'id="stage-summary"' in page.text
         scan = client.post("/api/v1/sources/articles/scan", json={}).json()
         created = client.post("/api/v1/jobs", json={
             "source_root_id": "articles", "relative_paths": [scan["files"][0]["relative_path"]],
@@ -112,3 +124,19 @@ def test_queued_job_can_be_cancelled_or_deleted(tmp_path: Path):
         assert deleted.status_code == 200
         assert deleted.json()["deleted"] is True
         assert client.get(f"/api/v1/jobs/{delete_job['job_id']}").status_code == 404
+
+
+def test_jobs_can_be_purged_in_any_state(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    (tmp_path / "articles" / "one.md").write_text("One", encoding="utf-8")
+    app = create_app(settings, start_worker=False)
+    with TestClient(app) as client:
+        created = client.post("/api/v1/jobs", json={"source_root_id": "articles", "relative_paths": ["one.md"]})
+        job_id = created.json()["jobs"][0]["job_id"]
+        continued = client.post(f"/api/v1/jobs/{job_id}/continue")
+        assert continued.status_code == 202
+        assert client.post("/api/v1/jobs/purge", json={"confirm": False}).status_code == 422
+        purged = client.post("/api/v1/jobs/purge", json={"confirm": True})
+        assert purged.status_code == 200
+        assert purged.json()["purged"] == 1
+        assert client.get(f"/api/v1/jobs/{job_id}").status_code == 404

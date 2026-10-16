@@ -36,9 +36,18 @@ curl -s "http://127.0.0.1:8080/api/v1/jobs/$JOB_ID/events" | jq
 curl -s "http://127.0.0.1:8080/api/v1/jobs/$JOB_ID/package" | jq
 ```
 
-The current UI starts runs and handles remote publication, but script approval
-and audio generation are still API actions until the planned stage toggles are
-added:
+The home page starts runs with per-stage toggles. Select the furthest desired
+stage; prerequisite stages are enabled automatically. The archive toggle
+controls whether the processed Markdown is moved to the local archive after
+the script artifact is persisted. Script approval and remote mutations remain
+explicit job-page actions.
+
+Recent Work also provides `Continue` for queued, review-ready, and recoverable
+failed jobs. `Purge` clears all indexed jobs and events after confirmation,
+regardless of state, but preserves generated artifacts and manifests.
+
+The equivalent script approval and audio actions are also available through
+the API:
 
 ```bash
 REVISION=$(curl -s "http://127.0.0.1:8080/api/v1/jobs/$JOB_ID" | jq -r .revision)
@@ -70,10 +79,3 @@ remote.published.status: published
 
 Queued jobs can be cancelled or deleted from their job page. A claimed or
 running job should be cancelled rather than deleted.
-
-## Next iteration
-
-The next UI change is to add explicit toggles for each stage—script creation,
-audio generation, upload/draft creation, publication, and any later archive
-step. Until then, script review and remote publication remain explicit actions,
-while audio is queued after script approval.

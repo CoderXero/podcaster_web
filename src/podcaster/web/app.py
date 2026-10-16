@@ -20,7 +20,7 @@ from .errors import APIError, api_error_handler, generic_error_handler, validati
 from fastapi.exceptions import RequestValidationError
 from .repository import Repository
 from .oauth import GumuGumuClient, OAuthClient, OAuthError
-from .schemas import ApproveRequest, JobCreateRequest, RetryRequest, ScanRequest, ScriptPatchRequest
+from .schemas import ApproveRequest, JobCreateRequest, PurgeRequest, RetryRequest, ScanRequest, ScriptPatchRequest
 from .security import Principal, SafePathError, SourcePolicy, authenticate, require_publisher, redact
 from .services import JobService
 from .worker import Worker
@@ -181,9 +181,19 @@ def create_app(settings: Settings | None = None, *, script_provider: Any | None 
     async def cancel_job(job_id: str, _: Principal = Depends(mutating_principal)):
         return service.request_cancel(job_id)
 
+    @app.post("/api/v1/jobs/{job_id}/continue", status_code=202)
+    async def continue_job(job_id: str, identity: Principal = Depends(mutating_principal)):
+        return service.continue_job(job_id, identity)
+
     @app.delete("/api/v1/jobs/{job_id}")
     async def delete_job(job_id: str, _: Principal = Depends(mutating_principal)):
         return service.delete_queued_job(job_id)
+
+    @app.post("/api/v1/jobs/purge")
+    async def purge_jobs(payload: PurgeRequest, _: Principal = Depends(mutating_principal)):
+        if not payload.confirm:
+            raise APIError(422, "PURGE_CONFIRMATION_REQUIRED", "Set confirm to true to purge all jobs.")
+        return {"purged": repository.purge_jobs()}
 
     @app.post("/api/v1/jobs/{job_id}/retry", status_code=202)
     async def retry_job(job_id: str, payload: RetryRequest, _: Principal = Depends(mutating_principal)):
@@ -332,19 +342,25 @@ def create_app(settings: Settings | None = None, *, script_provider: Any | None 
         return {"job_id": job_id, "local_stage": job["pipeline_stage"], "remote": job.get("remote")}
 
     @app.get("/", response_class=HTMLResponse)
-    async def dashboard(request: Request, _: Principal = Depends(principal)):
+    async def dashboard(request: Request, identity: Principal = Depends(principal)):
         jobs, total = repository.list_jobs(limit=20)
         sources = [{"source_root_id": root_id, "path": str(path), "readable": path.is_dir() and os.access(path, os.R_OK)}
                    for root_id, path in policy.roots.items()]
         return templates.TemplateResponse(request=request, name="dashboard.html", context={
             "request": request, "jobs": [service.public_job(j) for j in jobs], "total": total,
             "sources": sources, "voice_ids": settings.elevenlabs_voice_ids,
+            "publish_enabled": settings.web.enable_publish_actions and settings.web.contract_validated and identity.can_publish,
         })
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)
     async def job_page(request: Request, job_id: str, _: Principal = Depends(principal)):
+        stored_job = repository.get_job(job_id)
+        if not stored_job:
+            raise APIError(404, "NOT_FOUND", "Job not found.")
+        job = service.public_job(stored_job)
+        job["source_path"] = str(policy.child(stored_job["source_root_id"], stored_job["relative_path"], require_file=False))
         return templates.TemplateResponse(request=request, name="job.html", context={
-            "request": request, "job": service.get(job_id),
+            "request": request, "job": job,
             "publish_enabled": settings.web.enable_publish_actions and settings.web.contract_validated,
         })
 

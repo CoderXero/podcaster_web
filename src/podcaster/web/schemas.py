@@ -47,3 +47,8 @@ class ScriptPatchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     revision: int = Field(ge=1)
     script: dict[str, Any]
+
+
+class PurgeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirm: bool = False

@@ -23,6 +23,38 @@
       </label>
     </div>
     <p class="field-note">Voice IDs default from <code>ELEVENLABS_VOICE_IDS</code>. Changes here apply to this run only.</p>
+    <fieldset class="stage-options">
+      <legend>Run through</legend>
+      <p class="field-note">Choose the furthest stage to queue. Review, paid uploads, and publication remain explicit confirmations.</p>
+      <div class="stage-toggles" role="group" aria-label="Pipeline stages">
+        <label class="stage-toggle">
+          <input class="stage-toggle-input" type="checkbox" value="awaiting_approval" checked disabled>
+          <span class="stage-toggle-copy"><strong>Create script</strong><small>Generate and validate the two-speaker script.</small></span>
+          <span class="switch" aria-hidden="true"></span>
+        </label>
+        <label class="stage-toggle">
+          <input class="stage-toggle-input" type="checkbox" value="audio">
+          <span class="stage-toggle-copy"><strong>Create audio files</strong><small>After script approval, synthesize and validate the MP3.</small></span>
+          <span class="switch" aria-hidden="true"></span>
+        </label>
+        <label class="stage-toggle">
+          <input class="stage-toggle-input" type="checkbox" value="draft">
+          <span class="stage-toggle-copy"><strong>Upload / create draft</strong><small>Prepare the remote episode draft after audio is ready.</small></span>
+          <span class="switch" aria-hidden="true"></span>
+        </label>
+        <label class="stage-toggle {% if not publish_enabled %}is-gated{% endif %}">
+          <input class="stage-toggle-input" type="checkbox" value="published" {% if not publish_enabled %}disabled{% endif %}>
+          <span class="stage-toggle-copy"><strong>Publish episode</strong><small>{% if publish_enabled %}Leave the final publish confirmation for the job page.{% else %}Contract-gated; enable publishing to use this stage.{% endif %}</small></span>
+          <span class="switch" aria-hidden="true"></span>
+        </label>
+        <label class="stage-toggle archive-toggle">
+          <input id="archive-source" class="stage-toggle-input" type="checkbox" checked>
+          <span class="stage-toggle-copy"><strong>Archive source</strong><small>Move the processed Markdown into the local archive after the script is saved.</small></span>
+          <span class="switch" aria-hidden="true"></span>
+        </label>
+      </div>
+      <p id="stage-summary" class="stage-summary" aria-live="polite">Stops after the script is ready for review.</p>
+    </fieldset>
     <button class="primary-button" type="submit" {% if not sources %}disabled{% endif %}>Start process <span aria-hidden="true">→</span></button>
   </form>
   <div id="process-status" class="process-status" hidden aria-live="polite">
@@ -33,8 +65,8 @@
 </section>
 
 <section class="stats"><div><span>ALL JOBS</span><strong>{{ total }}</strong></div><div><span>LIVE WORKER</span><strong class="ok">READY</strong></div><div><span>REMOTE PUBLISH</span><strong class="warn">CONTRACT GATED</strong></div></section>
-<section class="card" id="jobs"><div class="section-head"><div><p class="eyebrow">RECENT WORK</p><h2>Pipeline jobs</h2></div><span class="mono">{{ total }} total</span></div>
-{% if jobs %}<div class="table">{% for job in jobs %}<a class="row" href="/jobs/{{ job.job_id }}"><div><strong>{{ job.title or job.slug }}</strong><small>{{ job.relative_path }}</small></div><div class="stage"><span class="pill {{ job.status }}">{{ job.status|replace('_',' ') }}</span><small>{{ job.pipeline_stage }}</small></div><div class="arrow">→</div></a>{% endfor %}</div>{% else %}<div class="empty">No jobs yet. Select a source folder above to begin.</div>{% endif %}</section>
+<section class="card" id="jobs"><div class="section-head"><div><p class="eyebrow">RECENT WORK</p><h2>Pipeline jobs</h2></div><div class="section-actions"><span class="mono">{{ total }} total</span><button id="purge-jobs" class="danger-button compact-danger" type="button">Purge</button></div></div>
+{% if jobs %}<div class="table">{% for job in jobs %}<div class="row"><a class="row-main" href="/jobs/{{ job.job_id }}"><div><strong>{{ job.title or job.slug }}</strong><small>{{ job.relative_path }}</small></div></a><div class="stage"><span class="pill {{ job.status }}">{{ job.status|replace('_',' ') }}</span><small>{{ job.pipeline_stage }}</small></div>{% if job.status not in ["succeeded", "reconciliation_required"] %}<button class="compact-button" type="button" data-continue-job="{{ job.job_id }}">Continue</button>{% else %}<a class="arrow" href="/jobs/{{ job.job_id }}" aria-label="Open job">→</a>{% endif %}</div>{% endfor %}</div>{% else %}<div class="empty">No jobs yet. Select a source folder above to begin.</div>{% endif %}</section>
 
 <script>
 (() => {
@@ -45,7 +77,30 @@
   const count = document.getElementById('process-count');
   const detail = document.getElementById('process-detail');
   const progress = document.getElementById('process-progress');
+  const stageToggles = [...document.querySelectorAll('.stage-toggle-input[value]')];
+  const archiveToggle = document.getElementById('archive-source');
+  const stageSummary = document.getElementById('stage-summary');
   const terminal = new Set(['awaiting_approval', 'succeeded', 'failed', 'cancelled', 'reconciliation_required']);
+  const stageDescriptions = {
+    awaiting_approval: 'Stops after the script is ready for review.',
+    audio: 'Stops after the approved script becomes a validated MP3.',
+    draft: 'Stops after audio is ready for the explicit remote draft action.',
+    published: 'Stops after audio is ready for explicit draft and publish confirmations.',
+  };
+
+  const syncStageToggles = event => {
+    const changed = event?.target;
+    const changedIndex = stageToggles.indexOf(changed);
+    if (changed && changedIndex > -1 && changed.checked) {
+      stageToggles.forEach((toggle, index) => { if (index <= changedIndex) toggle.checked = true; });
+    } else if (changed && changedIndex > -1 && !changed.checked) {
+      stageToggles.forEach((toggle, index) => { if (index >= changedIndex) toggle.checked = false; });
+    }
+    const selected = stageToggles.filter(toggle => toggle.checked).at(-1);
+    stageSummary.textContent = stageDescriptions[selected?.value || 'awaiting_approval'];
+  };
+  stageToggles.forEach(toggle => toggle.addEventListener('change', syncStageToggles));
+  syncStageToggles();
 
   const setStatus = (headline, description, completed = 0, total = 0) => {
     statusBox.hidden = false;
@@ -61,6 +116,39 @@
     if (!response.ok) throw new Error(body.error?.message || 'The request could not be completed.');
     return body;
   };
+
+  document.querySelectorAll('[data-continue-job]').forEach(button => {
+    button.addEventListener('click', async event => {
+      event.preventDefault();
+      button.disabled = true;
+      button.textContent = 'Continuing…';
+      try {
+        await api(`/api/v1/jobs/${button.dataset.continueJob}/continue`, {
+          method: 'POST',
+        });
+        window.location.reload();
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = 'Continue';
+        button.title = error.message;
+      }
+    });
+  });
+
+  const purgeButton = document.getElementById('purge-jobs');
+  purgeButton.addEventListener('click', async () => {
+    if (!window.confirm('Purge all jobs in every state? Job records and events will be removed; generated artifacts will be preserved.')) return;
+    purgeButton.disabled = true;
+    purgeButton.textContent = 'Purging…';
+    try {
+      await api('/api/v1/jobs/purge', {method: 'POST', body: JSON.stringify({confirm: true})});
+      window.location.reload();
+    } catch (error) {
+      purgeButton.disabled = false;
+      purgeButton.textContent = 'Purge';
+      purgeButton.title = error.message;
+    }
+  });
 
   const watchJobs = async jobs => {
     const ids = jobs.map(job => job.job_id);
@@ -86,6 +174,8 @@
     event.preventDefault();
     const sourceRootId = document.getElementById('source-root').value;
     const voiceIds = [document.getElementById('voice-host').value.trim(), document.getElementById('voice-guest').value.trim()];
+    const runUntil = stageToggles.filter(toggle => toggle.checked).at(-1)?.value || 'awaiting_approval';
+    const sourceDisposition = archiveToggle.checked ? 'archive' : 'keep';
     if (!sourceRootId || voiceIds.some(id => !id)) return setStatus('Complete the setup first', 'Choose a source folder and enter both voice IDs.');
     button.disabled = true;
     button.textContent = 'Scanning…';
@@ -95,7 +185,7 @@
       const relativePaths = scan.files.filter(file => !file.rejected && file.readable).map(file => file.relative_path);
       if (!relativePaths.length) throw new Error('No readable Markdown files were found in that folder.');
       setStatus('Queueing jobs', `${relativePaths.length} Markdown file${relativePaths.length === 1 ? '' : 's'} found.`);
-      const created = await api('/api/v1/jobs', {method: 'POST', body: JSON.stringify({source_root_id: sourceRootId, relative_paths: relativePaths, run_until: 'awaiting_approval', source_disposition: 'archive', voice_ids: voiceIds})});
+      const created = await api('/api/v1/jobs', {method: 'POST', body: JSON.stringify({source_root_id: sourceRootId, relative_paths: relativePaths, run_until: runUntil, source_disposition: sourceDisposition, voice_ids: voiceIds})});
       button.textContent = 'Processing…';
       await watchJobs(created.jobs);
     } catch (error) {

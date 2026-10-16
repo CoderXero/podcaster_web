@@ -2,7 +2,32 @@
 {% block title %}{{ job.title or job.slug }} · Podcaster{% endblock %}
 {% block content %}
 <a class="back" href="/">← All jobs</a><section class="job-head"><div><p class="eyebrow">{{ job.slug }}</p><h1>{{ job.title or job.slug }}</h1><p class="lede">{{ job.current_operation }}</p></div><span class="pill {{ job.status }}">{{ job.status|replace('_',' ') }}</span></section>
+<section class="card source-card"><div class="section-head"><div><p class="eyebrow">SOURCE ITEM</p><h2>Full path</h2></div><span class="mono">{{ job.relative_path }}</span></div><code class="source-path">{{ job.source_path }}</code></section>
 <section class="timeline card"><div class="section-head"><h2>Stage timeline</h2><span class="mono">{{ job.pipeline_stage }}</span></div><div class="track"><div class="track-fill"></div></div><p class="muted">Progress {{ job.progress.completed }} / {{ job.progress.total }} · Updated {{ job.updated_at }}</p></section>
+{% if job.pipeline_stage == "AWAITING_APPROVAL" and job.script %}
+<section class="card review-card"><div class="section-head"><div><p class="eyebrow">HUMAN REVIEW</p><h2>Approve generated script</h2></div><span class="mono">REVISION {{ job.revision }}</span></div>
+<p class="muted">Review the generated two-speaker script below. Approval queues the next configured stage.</p>
+<article class="script-preview"><h3>{{ job.script.title }}</h3>{% for segment in job.script.segments %}<p><strong>{{ segment.speaker }}</strong> {{ segment.text }}</p>{% endfor %}</article>
+<div class="action-row"><button id="approve-script" class="primary-button" type="button">Approve script &amp; continue</button></div><p id="approval-message" class="action-message" aria-live="polite"></p></section>
+<script>
+(() => {
+  const button = document.getElementById('approve-script');
+  const message = document.getElementById('approval-message');
+  button.addEventListener('click', async () => {
+    button.disabled = true; message.textContent = 'Approving and queueing the next stage…';
+    try {
+      const response = await fetch('/api/v1/jobs/{{ job.job_id }}/script/approve', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({revision: {{ job.revision }}}),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error?.message || 'Approval failed.');
+      window.location.reload();
+    } catch (error) { message.textContent = error.message; button.disabled = false; }
+  });
+})();
+</script>
+{% endif %}
 <section class="card"><div class="section-head"><h2>Operator actions</h2><span class="mono">{{ job.job_id }}</span></div>
 {% if job.status == "queued" %}
 <p class="muted">This job is waiting for the worker. You can cancel it, or remove it from the queue entirely.</p>

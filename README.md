@@ -93,8 +93,18 @@ fields, start control, and progress polling. A normal run follows this path:
 Remote mutations are intentionally explicit. The worker will not publish an
 episode automatically after audio generation.
 
-The current review and audio actions are available through the API while the
-stage-toggle UI is still pending:
+The home page now exposes per-stage toggles for script creation, audio
+generation, remote draft preparation, publication intent, and source
+archiving. Downstream stages automatically include their prerequisites. The
+selected stopping point is sent as `run_until`; script approval and remote
+mutations remain explicit actions on the job page.
+
+Recent Work provides `Continue` for queued, review-ready, and recoverable
+failed jobs. `Purge` removes all indexed job records and events after
+confirmation, regardless of state; generated artifacts and manifests are
+preserved on disk.
+
+The equivalent review and audio actions are also available through the API:
 
 ```bash
 JOB_ID=replace-with-job-id
@@ -115,11 +125,3 @@ Generated job state is kept locally in `podcasts/`, `manifests/`, and
 `logs/`. These directories are ignored by git. The SQLite database is also
 local and ignored. Store or back up these paths separately for a persistent
 deployment.
-
-## Next iteration
-
-The next planned UI change is a set of per-stage toggles: create script,
-create audio files, upload/create draft, publish, and later archive. The
-current controls already make script approval and publication explicit; the
-stage toggles will make the intended stopping point configurable when a run is
-started.

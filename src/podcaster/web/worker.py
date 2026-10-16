@@ -48,7 +48,11 @@ class Worker:
             if job:
                 try: self._execute(job)
                 except Exception as exc:
-                    self._fail(job["job_id"], "WORKER_ERROR", "The worker stopped unexpectedly.")
+                    # A deliberate purge may remove a claimed job while its
+                    # provider call is still finishing. Do not resurrect a
+                    # deleted record or let that expected race kill the worker.
+                    if self.repo.get_job(job["job_id"]):
+                        self._fail(job["job_id"], "WORKER_ERROR", "The worker stopped unexpectedly.")
                 finally:
                     self.repo.release_lease(job["job_id"])
                 continue
@@ -184,6 +188,8 @@ class Worker:
 
     def _fail(self, job_id: str, code: str, message: str) -> None:
         job = self.repo.get_job(job_id)
+        if not job:
+            return
         safe_message = redact(message)
         self.repo.update_job(job_id, status="failed", error_code=code, error_message=safe_message[:500],
                              safe_to_retry=True, current_operation="Failed")
