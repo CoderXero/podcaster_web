@@ -3,5 +3,80 @@
 {% block content %}
 <a class="back" href="/">← All jobs</a><section class="job-head"><div><p class="eyebrow">{{ job.slug }}</p><h1>{{ job.title or job.slug }}</h1><p class="lede">{{ job.current_operation }}</p></div><span class="pill {{ job.status }}">{{ job.status|replace('_',' ') }}</span></section>
 <section class="timeline card"><div class="section-head"><h2>Stage timeline</h2><span class="mono">{{ job.pipeline_stage }}</span></div><div class="track"><div class="track-fill"></div></div><p class="muted">Progress {{ job.progress.completed }} / {{ job.progress.total }} · Updated {{ job.updated_at }}</p></section>
-<section class="card"><div class="section-head"><h2>Operator actions</h2><span class="mono">{{ job.job_id }}</span></div><p class="muted">Review and publish actions are authenticated and intentionally explicit. Live updates arrive through the job event stream.</p></section>
+<section class="card"><div class="section-head"><h2>Operator actions</h2><span class="mono">{{ job.job_id }}</span></div>
+{% if job.status == "queued" %}
+<p class="muted">This job is waiting for the worker. You can cancel it, or remove it from the queue entirely.</p>
+<div class="action-row"><button id="cancel-job" class="secondary-button" type="button">Cancel job</button><button id="delete-job" class="danger-button" type="button">Delete queued job</button></div>
+<p id="action-message" class="action-message" aria-live="polite"></p>
+{% else %}<p class="muted">Review and publish actions are authenticated and intentionally explicit. Live updates arrive through the job event stream.</p>{% endif %}
+</section>
+{% if publish_enabled and job.pipeline_stage == "AUDIO_READY" and not job.remote %}
+<section class="card"><div class="section-head"><h2>Remote publication</h2><span class="mono">AUDIO READY</span></div>
+<p class="muted">Upload the validated MP3 and create a Gumu-Gumu draft. Publication remains a separate confirmed action.</p>
+<div class="action-row"><button id="create-draft" class="secondary-button" type="button">Create remote draft</button></div><p id="publish-message" class="action-message" aria-live="polite"></p></section>
+<script>
+(() => {
+  const button = document.getElementById('create-draft');
+  const message = document.getElementById('publish-message');
+  button.addEventListener('click', async () => {
+    button.disabled = true; message.textContent = 'Uploading and creating draft…';
+    try {
+      const response = await fetch('/api/v1/jobs/{{ job.job_id }}/publish/draft', {method: 'POST'});
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error?.message || 'Draft creation failed.');
+      window.location.reload();
+    } catch (error) { message.textContent = error.message; button.disabled = false; }
+  });
+})();
+</script>
+{% elif publish_enabled and job.remote and not job.remote.published %}
+<section class="card"><div class="section-head"><h2>Remote publication</h2><span class="mono">DRAFT READY</span></div>
+<p class="muted">Draft <code>{{ job.remote.draft.id }}</code> is ready. Publishing makes this episode publicly available.</p>
+<div class="action-row"><button id="publish-episode" class="danger-button" type="button">Publish episode</button></div><p id="publish-message" class="action-message" aria-live="polite"></p></section>
+<script>
+(() => {
+  const button = document.getElementById('publish-episode');
+  const message = document.getElementById('publish-message');
+  button.addEventListener('click', async () => {
+    if (!window.confirm('Publish this episode to Gumu-Gumu? This makes it publicly available.')) return;
+    button.disabled = true; message.textContent = 'Publishing and verifying…';
+    try {
+      const response = await fetch('/api/v1/jobs/{{ job.job_id }}/publish', {method: 'POST'});
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error?.message || 'Publication failed.');
+      window.location.reload();
+    } catch (error) { message.textContent = error.message; button.disabled = false; }
+  });
+})();
+</script>
+{% elif publish_enabled and job.remote and job.remote.published %}
+<section class="card"><div class="section-head"><h2>Remote publication</h2><span class="pill succeeded">Published</span></div><p class="muted">The remote episode was published and verified.</p></section>
+{% endif %}
+{% if job.status == "queued" %}
+<script>
+(() => {
+  const cancelButton = document.getElementById('cancel-job');
+  const deleteButton = document.getElementById('delete-job');
+  const message = document.getElementById('action-message');
+  const setBusy = text => { cancelButton.disabled = true; deleteButton.disabled = true; message.textContent = text; };
+  const request = async (url, options) => {
+    const response = await fetch(url, {headers: {'Content-Type': 'application/json'}, ...options});
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error?.message || 'The action could not be completed.');
+    return body;
+  };
+  cancelButton.addEventListener('click', async () => {
+    setBusy('Cancelling…');
+    try { await request('/api/v1/jobs/{{ job.job_id }}' + '/cancel', {method: 'POST'}); window.location.reload(); }
+    catch (error) { message.textContent = error.message; cancelButton.disabled = false; deleteButton.disabled = false; }
+  });
+  deleteButton.addEventListener('click', async () => {
+    if (!window.confirm('Delete this queued job? This cannot be undone.')) return;
+    setBusy('Deleting…');
+    try { await request('/api/v1/jobs/{{ job.job_id }}', {method: 'DELETE'}); window.location.assign('/'); }
+    catch (error) { message.textContent = error.message; cancelButton.disabled = false; deleteButton.disabled = false; }
+  });
+})();
+</script>
+{% endif %}
 {% endblock %}

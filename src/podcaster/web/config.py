@@ -57,8 +57,9 @@ class LLMSettings(BaseModel):
     wire_api: str = "responses"
     requires_openai_auth: bool = False
     supports_websockets: bool = False
-    timeout_seconds: float = Field(default=60, gt=0, le=600)
+    timeout_seconds: float = Field(default=180, gt=0, le=600)
     max_retries: int = Field(default=2, ge=0, le=5)
+    max_output_tokens: int = Field(default=1600, ge=256, le=16_384)
 
 
 class Settings(BaseModel):
@@ -76,6 +77,24 @@ class Settings(BaseModel):
     oauth_scope: str | None = None
     oauth_audience: str | None = None
     oauth_timeout_seconds: float = Field(default=30, gt=0, le=300)
+
+    @field_validator("elevenlabs_voice_ids", mode="before")
+    @classmethod
+    def parse_voice_ids(cls, value: Any) -> list[str]:
+        """Accept a JSON array (preferred) or a comma-separated dotenv value."""
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = value.split(",")
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("elevenlabs_voice_ids must be a list of two voice IDs")
+        voice_ids = [str(item).strip() for item in value if str(item).strip()]
+        if voice_ids and len(voice_ids) != 2:
+            raise ValueError("elevenlabs_voice_ids must contain exactly two voice IDs")
+        return voice_ids
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Settings":
@@ -117,13 +136,18 @@ class Settings(BaseModel):
             "PODCASTER_WEB_PORT": (web, "port", int),
             "PODCASTER_WEB_ALLOW_REMOTE_CLIENTS": (web, "allow_remote_clients", lambda value: value.lower() in {"1", "true", "yes"}),
             "PODCASTER_WEB_ENABLE_PUBLISH": (web, "enable_publish_actions", lambda value: value.lower() in {"1", "true", "yes"}),
+            "PODCASTER_WEB_CONTRACT_VALIDATED": (web, "contract_validated", lambda value: value.lower() in {"1", "true", "yes"}),
             "PODCASTER_LLM_BASE_URL": (raw.setdefault("llm", {}), "base_url", str),
             "PODCASTER_LLM_MODEL": (raw.setdefault("llm", {}), "model", str),
+            "PODCASTER_LLM_REASONING_EFFORT": (raw.setdefault("llm", {}), "reasoning_effort", str),
+            "PODCASTER_LLM_TIMEOUT_SECONDS": (raw.setdefault("llm", {}), "timeout_seconds", float),
+            "PODCASTER_LLM_MAX_OUTPUT_TOKENS": (raw.setdefault("llm", {}), "max_output_tokens", int),
             "GUMU_API_BASE_URL": (raw, "gumu_api_base_url", str),
             "OAUTH_DISCOVERY_URL": (raw, "oauth_discovery_url", str),
             "OAUTH_TOKEN_URL": (raw, "oauth_token_url", str),
             "OAUTH_SCOPE": (raw, "oauth_scope", str),
             "OAUTH_AUDIENCE": (raw, "oauth_audience", str),
+            "ELEVENLABS_VOICE_IDS": (raw, "elevenlabs_voice_ids", str),
         }
         for variable, (target, key, converter) in env_map.items():
             if os.getenv(variable) is not None:
@@ -159,11 +183,11 @@ class Settings(BaseModel):
     def output_roots(self) -> list[Path]:
         return [self.project_path(getattr(self.web, name)) for name in ("artifact_root", "manifest_root", "working_root", "archive_root", "published_root", "logs_root")]
 
-    def config_hash(self, source_disposition: str = "archive") -> str:
+    def config_hash(self, source_disposition: str = "archive", voice_ids: list[str] | None = None) -> str:
         data = {
             "web": self.web.model_dump(mode="json", exclude={"database_path"}),
             "llm": self.llm.model_dump(mode="json"),
-            "voices": self.elevenlabs_voice_ids,
+            "voices": voice_ids if voice_ids is not None else self.elevenlabs_voice_ids,
             "source_disposition": source_disposition,
             "publish_enabled": self.web.enable_publish_actions,
         }

@@ -19,7 +19,7 @@ from .config import Settings
 from .errors import APIError, api_error_handler, generic_error_handler, validation_error_handler
 from fastapi.exceptions import RequestValidationError
 from .repository import Repository
-from .oauth import OAuthClient, OAuthError
+from .oauth import GumuGumuClient, OAuthClient, OAuthError
 from .schemas import ApproveRequest, JobCreateRequest, RetryRequest, ScanRequest, ScriptPatchRequest
 from .security import Principal, SafePathError, SourcePolicy, authenticate, require_publisher, redact
 from .services import JobService
@@ -36,8 +36,9 @@ def create_app(settings: Settings | None = None, *, script_provider: Any | None 
         raise RuntimeError(f"Invalid filesystem configuration: {exc}") from exc
     database = settings.project_path(settings.web.database_path)
     repository = Repository(database)
-    service = JobService(settings, repository, policy, script_provider, audio_provider)
     oauth = OAuthClient(settings)
+    gumu_client = GumuGumuClient(settings, oauth)
+    service = JobService(settings, repository, policy, script_provider, audio_provider, gumu_client)
     worker = Worker(service)
     service.set_worker(worker)
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -48,6 +49,7 @@ def create_app(settings: Settings | None = None, *, script_provider: Any | None 
         if start_worker: worker.start()
         yield
         if start_worker: worker.stop()
+        gumu_client.client.close()
         oauth.client.close()
 
     app = FastAPI(title="GUMU-GUMU / PODCASTER", version="0.1.0", lifespan=lifespan)
@@ -90,10 +92,12 @@ def create_app(settings: Settings | None = None, *, script_provider: Any | None 
         source = []
         for root_id, path in policy.roots.items():
             source.append({"id": root_id, "path_configured": True, "readable": path.is_dir() and os.access(path, os.R_OK)})
+        artifact_root = settings.project_path(settings.web.artifact_root)
+        storage_ready = artifact_root.is_dir() and os.access(artifact_root, os.W_OK)
         return {"status": "ok" if all(x["readable"] for x in source) else "degraded", "checks": {
             "local_pipeline": True, "llm": bool(os.getenv(settings.llm.api_key_env)),
             "elevenlabs": bool(os.getenv(settings.elevenlabs_api_key_env) and len(settings.elevenlabs_voice_ids) == 2),
-            "storage": False, "oauth": oauth.configured, "gumu_contract": settings.web.contract_validated,
+            "storage": storage_ready, "oauth": oauth.configured, "gumu_contract": settings.web.contract_validated,
         }, "sources": source}
 
     @app.get("/api/v1/diagnostics")
@@ -116,7 +120,8 @@ def create_app(settings: Settings | None = None, *, script_provider: Any | None 
                           "allow_remote_clients": settings.web.allow_remote_clients,
                           "max_concurrent_jobs": settings.web.max_concurrent_jobs,
                           "publish_actions_enabled": settings.web.enable_publish_actions,
-                          "source_roots": list(policy.roots)},
+                "source_roots": list(policy.roots),
+                "voice_ids": settings.elevenlabs_voice_ids},
                 "llm": {"provider": settings.llm.model_provider, "model": settings.llm.model,
                         "reasoning_effort": settings.llm.reasoning_effort, "base_url": settings.llm.base_url,
                         "api_key_configured": bool(os.getenv(settings.llm.api_key_env))},
@@ -175,6 +180,10 @@ def create_app(settings: Settings | None = None, *, script_provider: Any | None 
     @app.post("/api/v1/jobs/{job_id}/cancel", status_code=202)
     async def cancel_job(job_id: str, _: Principal = Depends(mutating_principal)):
         return service.request_cancel(job_id)
+
+    @app.delete("/api/v1/jobs/{job_id}")
+    async def delete_job(job_id: str, _: Principal = Depends(mutating_principal)):
+        return service.delete_queued_job(job_id)
 
     @app.post("/api/v1/jobs/{job_id}/retry", status_code=202)
     async def retry_job(job_id: str, payload: RetryRequest, _: Principal = Depends(mutating_principal)):
@@ -289,21 +298,25 @@ def create_app(settings: Settings | None = None, *, script_provider: Any | None 
     async def publish_preflight(job_id: str, _: Principal = Depends(publisher)):
         job = repository.get_job(job_id)
         if not job: raise APIError(404, "NOT_FOUND", "Job not found.")
-        return {"ready": bool(settings.web.contract_validated and settings.web.enable_publish_actions),
+        audio_path = settings.project_path(settings.web.artifact_root) / job["slug"] / "podcast.mp3"
+        storage_root = settings.project_path(settings.web.artifact_root)
+        storage_ready = storage_root.is_dir() and os.access(storage_root, os.W_OK)
+        package_ready = job["pipeline_stage"] == "AUDIO_READY" and audio_path.is_file()
+        return {"ready": bool(settings.web.contract_validated and settings.web.enable_publish_actions and oauth.configured and storage_ready and package_ready),
                 "contract": "validated" if settings.web.contract_validated else "contract_not_validated",
-                "checks": {"package": job["pipeline_stage"] == "AUDIO_READY", "storage": False, "oauth": oauth.configured}}
+                "checks": {"package": package_ready, "storage": storage_ready, "oauth": oauth.configured}}
 
     @app.post("/api/v1/jobs/{job_id}/publish/draft", status_code=202)
     async def publish_draft(job_id: str, _: Principal = Depends(publisher)):
         if not settings.web.enable_publish_actions or not settings.web.contract_validated:
             raise APIError(409, "CONTRACT_NOT_VALIDATED", "Publishing is disabled until the remote contract is validated.")
-        raise APIError(501, "PUBLISH_ADAPTER_NOT_CONFIGURED", "No validated publishing adapter is configured.")
+        return service.create_remote_draft(job_id)
 
     @app.post("/api/v1/jobs/{job_id}/publish", status_code=202)
     async def publish(job_id: str, _: Principal = Depends(publisher)):
         if not settings.web.enable_publish_actions or not settings.web.contract_validated:
             raise APIError(409, "CONTRACT_NOT_VALIDATED", "Publishing is disabled until the remote contract is validated.")
-        raise APIError(501, "PUBLISH_ADAPTER_NOT_CONFIGURED", "No validated publishing adapter is configured.")
+        return service.publish_remote(job_id)
 
     @app.post("/api/v1/jobs/{job_id}/publish/reconcile")
     async def reconcile(job_id: str, _: Principal = Depends(publisher)):
@@ -321,16 +334,24 @@ def create_app(settings: Settings | None = None, *, script_provider: Any | None 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request, _: Principal = Depends(principal)):
         jobs, total = repository.list_jobs(limit=20)
-        return templates.TemplateResponse(request=request, name="dashboard.html", context={"request": request, "jobs": [service.public_job(j) for j in jobs], "total": total})
+        sources = [{"source_root_id": root_id, "path": str(path), "readable": path.is_dir() and os.access(path, os.R_OK)}
+                   for root_id, path in policy.roots.items()]
+        return templates.TemplateResponse(request=request, name="dashboard.html", context={
+            "request": request, "jobs": [service.public_job(j) for j in jobs], "total": total,
+            "sources": sources, "voice_ids": settings.elevenlabs_voice_ids,
+        })
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)
     async def job_page(request: Request, job_id: str, _: Principal = Depends(principal)):
-        return templates.TemplateResponse(request=request, name="job.html", context={"request": request, "job": service.get(job_id)})
+        return templates.TemplateResponse(request=request, name="job.html", context={
+            "request": request, "job": service.get(job_id),
+            "publish_enabled": settings.web.enable_publish_actions and settings.web.contract_validated,
+        })
 
     return app
 
 
-app = create_app(start_worker=False)
+app = create_app(start_worker=True)
 
 
 def main() -> None:

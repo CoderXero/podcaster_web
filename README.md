@@ -1,9 +1,12 @@
 # Podcaster Web
 
-Podcaster Web is a small FastAPI operator console for the
-file-based Markdown-to-podcast workflow described in `spec.md`. It keeps
-manifests and artifacts on disk and uses SQLite only as a queryable job/event
-index.
+Podcaster Web is a small FastAPI operator console for the file-based
+Markdown-to-podcast workflow described in `spec.md`. It keeps manifests and
+artifacts on disk and uses SQLite only as a queryable job/event index.
+
+The current implementation supports the local pipeline end to end: source
+discovery, two-speaker script generation and review, ElevenLabs audio
+generation, Gumu-Gumu draft creation, and explicit publication verification.
 
 The default `.env.example` configuration is intended for a local operator:
 authentication is disabled and the app binds only to `127.0.0.1`. Do not use
@@ -29,26 +32,32 @@ Important variables:
   platform path separator.
 - `PODCASTER_WEB_AUTH_MODE` — `disabled` for trusted localhost use or `bearer`
   for protected API/browser access.
+- `PODCASTER_WEB_ENABLE_PUBLISH` and `PODCASTER_WEB_CONTRACT_VALIDATED` — both
+  must be true before remote draft creation or publication is allowed.
 - `PODCASTER_WEB_TOKENS` — bearer tokens in the form
   `token=role:user`, used only when auth mode is `bearer`.
 - `PODCAST_CLIENT_ID` and `PODCAST_CLIENT_SECRET` — server-side OAuth2 client
   credentials for Gumu-Gumu.
 - `OAUTH_DISCOVERY_URL` or `OAUTH_TOKEN_URL` — OAuth endpoint configuration.
 - `ELEVENLABS_API_KEY` — server-side ElevenLabs credential.
+- `PODCASTER_LLM_TIMEOUT_SECONDS` and `PODCASTER_LLM_MAX_OUTPUT_TOKENS` — local
+  model safeguards for bounded script-generation requests.
+- `ELEVENLABS_VOICE_IDS` — JSON array containing exactly two voice IDs, in
+  host/guest order (for example, `["host-id","guest-id"]`). A comma-separated
+  value is also accepted for dotenv convenience.
 
 Keep `PODCAST_CLIENT_ID`, `PODCAST_CLIENT_SECRET`, and `ELEVENLABS_API_KEY`
 in `.env` only. The OAuth client uses the client-credentials grant, caches its
 access token in memory, and refreshes it once when a remote request returns
 `401 Unauthorized`.
 
+Audio generation uses `ffmpeg` to concatenate the two-speaker ElevenLabs
+segments; install it on the host before running audio jobs.
+
 For local-only use, `PODCASTER_WEB_AUTH_MODE=disabled` removes the browser/API
 bearer-token requirement. Re-enable `bearer` before exposing the app to a
-network.
-
-The OAuth client uses the client-credentials grant, caches access tokens only
-in memory, refreshes them before expiry, and obtains a replacement once after
-a remote `401 Unauthorized` response. Secrets are never written to SQLite,
-manifests, browser responses, or logs.
+network. Publishing is fail-closed in `.env.example`; enable it only after
+the remote contract and credentials have been validated.
 
 The default bind address is `127.0.0.1`. Publishing is deliberately disabled
 until a validated remote contract is configured. Provider clients are
@@ -69,11 +78,48 @@ curl http://127.0.0.1:8080/health/live
 curl http://127.0.0.1:8080/api/v1/diagnostics
 ```
 
-## Current integration boundary
+## Run a complete episode
 
-The repository originally contained the implementation specification but not
-the prior file-based pipeline or validated Gumu-Gumu contract. The web layer
-therefore provides provider interfaces, structured Tiiny Responses support,
-OAuth/token refresh, review/state management, and fail-closed publishing
-routes. Live publishing remains disabled until the remote API contract,
-storage adapter, and existing media pipeline are supplied and validated.
+The home page provides the source-folder selector, host and guest voice-ID
+fields, start control, and progress polling. A normal run follows this path:
+
+1. Select a configured source folder and start the run.
+2. Review the generated script when the job reaches `AWAITING_APPROVAL`.
+3. Approve the script and queue audio generation.
+4. On the job page, create a remote draft after the MP3 reaches `AUDIO_READY`.
+5. Confirm `Publish episode`; the service verifies the remote `published`
+   state before marking the local job `PUBLISHED_VERIFIED`.
+
+Remote mutations are intentionally explicit. The worker will not publish an
+episode automatically after audio generation.
+
+The current review and audio actions are available through the API while the
+stage-toggle UI is still pending:
+
+```bash
+JOB_ID=replace-with-job-id
+REVISION=$(curl -s "http://127.0.0.1:8080/api/v1/jobs/$JOB_ID" | jq -r .revision)
+curl -s -X POST "http://127.0.0.1:8080/api/v1/jobs/$JOB_ID/script/approve" \
+  -H 'Content-Type: application/json' -d "{\"revision\":$REVISION}" | jq
+curl -s -X POST "http://127.0.0.1:8080/api/v1/jobs/$JOB_ID/audio/generate" | jq
+```
+
+For the detailed operator flow and stage-specific troubleshooting, see
+[`docs/operations.md`](docs/operations.md). Configuration details are in
+[`docs/configuration.md`](docs/configuration.md).
+
+## Runtime output
+
+Generated job state is kept locally in `podcasts/`, `manifests/`, and
+`working/`, with reserved directories for `archive/`, `published/`, and
+`logs/`. These directories are ignored by git. The SQLite database is also
+local and ignored. Store or back up these paths separately for a persistent
+deployment.
+
+## Next iteration
+
+The next planned UI change is a set of per-stage toggles: create script,
+create audio files, upload/create draft, publish, and later archive. The
+current controls already make script approval and publication explicit; the
+stage toggles will make the intended stopping point configurable when a run is
+started.

@@ -63,13 +63,16 @@ class Repository:
               result_json TEXT NOT NULL, created_at TEXT NOT NULL
             );
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
+            if "voice_ids_json" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN voice_ids_json TEXT")
 
     @staticmethod
     def _decode(row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:
             return None
         data = dict(row)
-        for key in ("manifest_json", "script_json", "remote_json"):
+        for key in ("manifest_json", "script_json", "remote_json", "voice_ids_json"):
             if data.get(key):
                 data[key[:-5] if key.endswith("_json") else key] = json.loads(data[key])
             data.pop(key, None)
@@ -80,7 +83,7 @@ class Repository:
 
     def create_job(self, data: dict[str, Any]) -> dict[str, Any]:
         columns = list(data)
-        values = [json.dumps(data[c], separators=(",", ":")) if c in {"manifest_json", "script_json", "remote_json"} and data[c] is not None else data[c] for c in columns]
+        values = [json.dumps(data[c], separators=(",", ":")) if c in {"manifest_json", "script_json", "remote_json", "voice_ids_json"} and data[c] is not None else data[c] for c in columns]
         with self._lock, self._connect() as db:
             try:
                 db.execute(f"INSERT INTO jobs ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", values)
@@ -117,13 +120,29 @@ class Repository:
         columns, values = [], []
         for key, value in changes.items():
             columns.append(f"{key}=?")
-            values.append(json.dumps(value, separators=(",", ":")) if key in {"manifest_json", "script_json", "remote_json"} and value is not None else value)
+            values.append(json.dumps(value, separators=(",", ":")) if key in {"manifest_json", "script_json", "remote_json", "voice_ids_json"} and value is not None else value)
         values.append(job_id)
         with self._lock, self._connect() as db:
             cursor = db.execute(f"UPDATE jobs SET {','.join(columns)} WHERE job_id=?", values)
             if cursor.rowcount != 1:
                 raise KeyError(job_id)
         return self.get_job(job_id)
+
+    def delete_queued_job(self, job_id: str) -> bool:
+        """Delete only while the worker has not claimed the queued job."""
+        with self._lock, self._connect() as db:
+            cursor = db.execute("DELETE FROM jobs WHERE job_id=? AND status='queued'", (job_id,))
+            return cursor.rowcount == 1
+
+    def cancel_queued_job(self, job_id: str) -> bool:
+        """Cancel atomically before a worker can claim the queued job."""
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                "UPDATE jobs SET status='cancelled', pipeline_stage='CANCELLED', current_operation='Cancelled', "
+                "safe_to_retry=1, cancel_requested=1, updated_at=? WHERE job_id=? AND status='queued'",
+                (now_iso(), job_id),
+            )
+            return cursor.rowcount == 1
 
     def append_event(self, job_id: str, event_type: str, message: str, *, stage: str | None = None,
                      payload: dict[str, Any] | None = None) -> dict[str, Any]:

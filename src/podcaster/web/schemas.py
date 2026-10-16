@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ScanRequest(BaseModel):
@@ -22,6 +22,17 @@ class JobCreateRequest(BaseModel):
     source_disposition: str = "archive"
     force: bool = False
     confirm_source_delete: bool = False
+    voice_ids: list[str] | None = Field(default=None, min_length=2, max_length=2)
+
+    @field_validator("voice_ids")
+    @classmethod
+    def valid_voice_ids(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        cleaned = [voice_id.strip() for voice_id in value]
+        if any(not voice_id for voice_id in cleaned):
+            raise ValueError("voice_ids must contain two non-empty voice IDs")
+        return cleaned
 
 
 class RetryRequest(BaseModel):
@@ -36,4 +47,3 @@ class ScriptPatchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     revision: int = Field(ge=1)
     script: dict[str, Any]
-

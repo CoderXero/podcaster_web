@@ -20,3 +20,17 @@ def test_settings_load_dotenv(tmp_path: Path, monkeypatch):
     assert settings.web.source_roots == ["articles"]
     assert settings.source_root_map()["articles"] == source.resolve()
     assert settings.web.admin_tokens_from_env == "PODCASTER_WEB_TOKENS"
+
+
+def test_settings_loads_two_voice_ids_from_dotenv(tmp_path: Path, monkeypatch):
+    source = tmp_path / "articles"
+    source.mkdir()
+    (tmp_path / ".env").write_text(
+        'PODCASTER_WEB_SOURCE_ROOTS=articles\n'
+        'ELEVENLABS_VOICE_IDS=["host-id","guest-id"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("PODCASTER_WEB_SOURCE_ROOTS", raising=False)
+    monkeypatch.delenv("ELEVENLABS_VOICE_IDS", raising=False)
+    settings = Settings.load(tmp_path / "missing.yaml")
+    assert settings.elevenlabs_voice_ids == ["host-id", "guest-id"]

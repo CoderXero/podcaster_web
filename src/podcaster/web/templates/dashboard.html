@@ -1,8 +1,109 @@
 {% extends "base.html" %}
 {% block title %}Dashboard · GUMU-GUMU / PODCASTER{% endblock %}
 {% block content %}
-<section class="hero"><p class="eyebrow">OPERATOR CONSOLE</p><h1>Make the next episode<br><em>worth pressing play.</em></h1><p class="lede">A careful workspace for turning trusted Markdown into reviewable, publishable audio.</p></section>
+<section class="hero"><p class="eyebrow">OPERATOR CONSOLE</p><h1>Make the next episode<br><em>worth pressing play.</em></h1><p class="lede">Turn trusted Markdown into a reviewable, two-person podcast episode.</p></section>
+
+<section class="card process-card" id="process">
+  <div class="section-head"><div><p class="eyebrow">NEW EPISODE</p><h2>Start a podcast run</h2></div><span class="mono">SCRIPT → REVIEW</span></div>
+  <form id="process-form" class="process-form">
+    <label class="field field-wide" for="source-root">Source folder
+      <select id="source-root" name="source_root_id" required {% if not sources %}disabled{% endif %}>
+        <option value="" selected disabled>Select a configured folder</option>
+        {% for source in sources %}
+        <option value="{{ source.source_root_id }}" {% if not source.readable %}disabled{% endif %}>{{ source.source_root_id }} · {{ source.path }}{% if not source.readable %} (unreadable){% endif %}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <div class="voice-grid">
+      <label class="field" for="voice-host">Host voice ID
+        <input id="voice-host" name="voice_host" value="{{ voice_ids[0] if voice_ids|length > 0 else '' }}" placeholder="ElevenLabs host voice ID" autocomplete="off" required>
+      </label>
+      <label class="field" for="voice-guest">Guest voice ID
+        <input id="voice-guest" name="voice_guest" value="{{ voice_ids[1] if voice_ids|length > 1 else '' }}" placeholder="ElevenLabs guest voice ID" autocomplete="off" required>
+      </label>
+    </div>
+    <p class="field-note">Voice IDs default from <code>ELEVENLABS_VOICE_IDS</code>. Changes here apply to this run only.</p>
+    <button class="primary-button" type="submit" {% if not sources %}disabled{% endif %}>Start process <span aria-hidden="true">→</span></button>
+  </form>
+  <div id="process-status" class="process-status" hidden aria-live="polite">
+    <div class="status-line"><strong id="process-message">Ready</strong><span id="process-count" class="mono">0 / 0</span></div>
+    <div class="track"><div id="process-progress" class="track-fill"></div></div>
+    <p id="process-detail" class="muted">The selected folder will be scanned for Markdown files.</p>
+  </div>
+</section>
+
 <section class="stats"><div><span>ALL JOBS</span><strong>{{ total }}</strong></div><div><span>LIVE WORKER</span><strong class="ok">READY</strong></div><div><span>REMOTE PUBLISH</span><strong class="warn">CONTRACT GATED</strong></div></section>
-<section class="card"><div class="section-head"><div><p class="eyebrow">RECENT WORK</p><h2>Pipeline jobs</h2></div><span class="mono">{{ total }} total</span></div>
-{% if jobs %}<div class="table">{% for job in jobs %}<a class="row" href="/jobs/{{ job.job_id }}"><div><strong>{{ job.title or job.slug }}</strong><small>{{ job.relative_path }}</small></div><div class="stage"><span class="pill {{ job.status }}">{{ job.status|replace('_',' ') }}</span><small>{{ job.pipeline_stage }}</small></div><div class="arrow">→</div></a>{% endfor %}</div>{% else %}<div class="empty">No jobs yet. Configure a source folder and scan it to begin.</div>{% endif %}</section>
+<section class="card" id="jobs"><div class="section-head"><div><p class="eyebrow">RECENT WORK</p><h2>Pipeline jobs</h2></div><span class="mono">{{ total }} total</span></div>
+{% if jobs %}<div class="table">{% for job in jobs %}<a class="row" href="/jobs/{{ job.job_id }}"><div><strong>{{ job.title or job.slug }}</strong><small>{{ job.relative_path }}</small></div><div class="stage"><span class="pill {{ job.status }}">{{ job.status|replace('_',' ') }}</span><small>{{ job.pipeline_stage }}</small></div><div class="arrow">→</div></a>{% endfor %}</div>{% else %}<div class="empty">No jobs yet. Select a source folder above to begin.</div>{% endif %}</section>
+
+<script>
+(() => {
+  const form = document.getElementById('process-form');
+  const button = form.querySelector('button[type="submit"]');
+  const statusBox = document.getElementById('process-status');
+  const message = document.getElementById('process-message');
+  const count = document.getElementById('process-count');
+  const detail = document.getElementById('process-detail');
+  const progress = document.getElementById('process-progress');
+  const terminal = new Set(['awaiting_approval', 'succeeded', 'failed', 'cancelled', 'reconciliation_required']);
+
+  const setStatus = (headline, description, completed = 0, total = 0) => {
+    statusBox.hidden = false;
+    message.textContent = headline;
+    detail.textContent = description;
+    count.textContent = `${completed} / ${total}`;
+    progress.style.width = `${total ? Math.round((completed / total) * 100) : 0}%`;
+  };
+
+  const api = async (url, options = {}) => {
+    const response = await fetch(url, {headers: {'Content-Type': 'application/json'}, ...options});
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error?.message || 'The request could not be completed.');
+    return body;
+  };
+
+  const watchJobs = async jobs => {
+    const ids = jobs.map(job => job.job_id);
+    for (;;) {
+      const items = await Promise.all(ids.map(id => api(`/api/v1/jobs/${id}`)));
+      const completed = items.filter(job => terminal.has(job.status)).length;
+      const active = items.filter(job => !terminal.has(job.status));
+      const failed = items.filter(job => job.status === 'failed').length;
+      const headline = failed ? `${failed} job${failed === 1 ? '' : 's'} failed` : (completed === items.length ? 'Run complete' : 'Processing source files');
+      const operations = active.map(job => job.current_operation).filter(Boolean).slice(0, 2).join(' · ');
+      setStatus(headline, operations || (completed === items.length ? 'Scripts are ready for review.' : 'The worker is moving through the queue.'), completed, items.length);
+      if (completed === items.length) {
+        button.disabled = false;
+        button.innerHTML = 'Start another run <span aria-hidden="true">→</span>';
+        if (!failed) window.setTimeout(() => window.location.reload(), 1200);
+        return;
+      }
+      await new Promise(resolve => window.setTimeout(resolve, 1000));
+    }
+  };
+
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    const sourceRootId = document.getElementById('source-root').value;
+    const voiceIds = [document.getElementById('voice-host').value.trim(), document.getElementById('voice-guest').value.trim()];
+    if (!sourceRootId || voiceIds.some(id => !id)) return setStatus('Complete the setup first', 'Choose a source folder and enter both voice IDs.');
+    button.disabled = true;
+    button.textContent = 'Scanning…';
+    setStatus('Scanning source folder', 'Looking for Markdown files in the selected folder.');
+    try {
+      const scan = await api(`/api/v1/sources/${encodeURIComponent(sourceRootId)}/scan`, {method: 'POST', body: JSON.stringify({})});
+      const relativePaths = scan.files.filter(file => !file.rejected && file.readable).map(file => file.relative_path);
+      if (!relativePaths.length) throw new Error('No readable Markdown files were found in that folder.');
+      setStatus('Queueing jobs', `${relativePaths.length} Markdown file${relativePaths.length === 1 ? '' : 's'} found.`);
+      const created = await api('/api/v1/jobs', {method: 'POST', body: JSON.stringify({source_root_id: sourceRootId, relative_paths: relativePaths, run_until: 'awaiting_approval', source_disposition: 'archive', voice_ids: voiceIds})});
+      button.textContent = 'Processing…';
+      await watchJobs(created.jobs);
+    } catch (error) {
+      button.disabled = false;
+      button.innerHTML = 'Try again <span aria-hidden="true">→</span>';
+      setStatus('Could not start run', error.message, 0, 0);
+    }
+  });
+})();
+</script>
 {% endblock %}

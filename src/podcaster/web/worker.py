@@ -153,7 +153,11 @@ class Worker:
                              current_operation="Synthesizing approved script", safe_to_retry=False)
         self.repo.append_event(job_id, "stage_started", "Generating audio", stage=PipelineStage.AUDIO_GENERATING.value)
         try:
-            output = self.service.audio_provider.synthesize(job["script"], str(self.service.settings.project_path(self.service.settings.web.artifact_root)), settings=self.service.settings)
+            audio_settings = self.service.settings
+            if job.get("voice_ids"):
+                audio_settings = self.service.settings.model_copy(update={"elevenlabs_voice_ids": job["voice_ids"]})
+            package_dir = self.service.settings.project_path(self.service.settings.web.artifact_root) / job["slug"]
+            output = self.service.audio_provider.synthesize(job["script"], str(package_dir), settings=audio_settings)
             if not isinstance(output, dict) or not output.get("mp3_path"):
                 raise ProviderError("AUDIO_INVALID", "Audio provider did not return a validated MP3 artifact.")
             mp3 = Path(output["mp3_path"])

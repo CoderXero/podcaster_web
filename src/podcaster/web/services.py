@@ -10,14 +10,16 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from mutagen.mp3 import MP3
 from pydantic import ValidationError
 
 from ..domain import Manifest, PipelineStage, Script, public_stage_status
 from .config import Settings
 from .errors import APIError
-from .providers import NoAudioProvider, ProviderError, ResponsesScriptProvider
+from .providers import ElevenLabsAudioProvider, ProviderError, ResponsesScriptProvider
 from .repository import Repository, now_iso
 from .security import SourcePolicy, sha256_file, slugify
+from .oauth import GumuGumuClient, OAuthError, RemoteHTTPError
 
 
 def atomic_json(path: Path, data: Any) -> None:
@@ -29,10 +31,12 @@ def atomic_json(path: Path, data: Any) -> None:
 
 class JobService:
     def __init__(self, settings: Settings, repo: Repository, policy: SourcePolicy,
-                 script_provider: Any | None = None, audio_provider: Any | None = None):
+                 script_provider: Any | None = None, audio_provider: Any | None = None,
+                 publisher: GumuGumuClient | None = None):
         self.settings, self.repo, self.policy = settings, repo, policy
         self.script_provider = script_provider or ResponsesScriptProvider()
-        self.audio_provider = audio_provider or NoAudioProvider()
+        self.audio_provider = audio_provider or ElevenLabsAudioProvider()
+        self.publisher = publisher
         self._worker = None
         self._cancel = set()
         self._cancel_lock = threading.Lock()
@@ -75,6 +79,9 @@ class JobService:
             raise APIError(422, "INVALID_JOB_REQUEST", "Invalid source disposition.")
         if disposition == "delete" and not (self.settings.web.enable_source_delete and payload.get("confirm_source_delete")):
             raise APIError(403, "SOURCE_DELETE_DISABLED", "Source deletion is disabled or not explicitly confirmed.")
+        voice_ids = payload.get("voice_ids") or self.settings.elevenlabs_voice_ids
+        if voice_ids and len(voice_ids) != 2:
+            raise APIError(422, "INVALID_VOICE_IDS", "Exactly two voice IDs are required.")
         batch_id = str(uuid4()) if len(relative_paths) > 1 else None
         created = []
         errors = []
@@ -91,12 +98,15 @@ class JobService:
                 continue
             source_id = hashlib.sha256(f"{root_id}:{relative}".encode()).hexdigest()[:24]
             slug = slugify(Path(relative).stem)
-            config_hash = self.settings.config_hash(disposition)
+            config_hash = self.settings.config_hash(disposition, voice_ids)
             # A normal duplicate is an idempotent attach/no-op.
             existing, _ = self.repo.list_jobs(limit=1000)
             if not payload.get("force"):
                 match = next((j for j in existing if j["source_file_id"] == source_id and j["source_sha256"] == digest and j["config_snapshot_hash"] == config_hash and not j["force"]), None)
                 if match:
+                    if match["status"] in {"failed", "cancelled"}:
+                        created.append(self.retry(match["job_id"], "script"))
+                        continue
                     created.append(match); continue
             job_id = str(uuid4())
             manifest_path = str(self.settings.project_path(self.settings.web.manifest_root) / f"{slug}-{job_id}.json")
@@ -107,6 +117,7 @@ class JobService:
                 "config_snapshot_hash": config_hash, "status": "queued", "pipeline_stage": PipelineStage.SOURCE_DISCOVERED.value,
                 "run_until": "awaiting_approval" if run_until == "script" else run_until,
                 "source_disposition": disposition, "force": bool(payload.get("force")), "title": Path(relative).stem,
+                "voice_ids_json": voice_ids or None,
                 "current_operation": "Queued", "created_at": now_iso(), "updated_at": now_iso(), "safe_to_retry": True,
             }))
             self.repo.append_event(job_id, "job_queued", "Job queued", stage=PipelineStage.SOURCE_DISCOVERED.value)
@@ -132,10 +143,29 @@ class JobService:
         if not job: raise APIError(404, "NOT_FOUND", "Job not found.")
         if job["status"] in {"succeeded", "cancelled"}:
             raise APIError(409, "INVALID_STATE", "This job is already complete.")
+        if job["status"] == "queued":
+            if self.repo.cancel_queued_job(job_id):
+                self.repo.append_event(job_id, "cancelled", "Queued job cancelled", stage=PipelineStage.CANCELLED.value)
+                return self.get(job_id)
+            job = self.repo.get_job(job_id)
+            if not job:
+                raise APIError(404, "NOT_FOUND", "Job not found.")
+            if job["status"] in {"succeeded", "cancelled"}:
+                raise APIError(409, "INVALID_STATE", "This job is already complete.")
         self.repo.update_job(job_id, cancel_requested=True, current_operation="Cancellation requested")
         with self._cancel_lock: self._cancel.add(job_id)
         self.repo.append_event(job_id, "cancel_requested", "Cancellation requested", stage=job["pipeline_stage"])
         return self.get(job_id)
+
+    def delete_queued_job(self, job_id: str) -> dict[str, Any]:
+        job = self.repo.get_job(job_id)
+        if not job:
+            raise APIError(404, "NOT_FOUND", "Job not found.")
+        if job["status"] != "queued":
+            raise APIError(409, "INVALID_STATE", "Only a queued job can be deleted.", {"status": job["status"]})
+        if not self.repo.delete_queued_job(job_id):
+            raise APIError(409, "JOB_ALREADY_CLAIMED", "The worker claimed this job; cancel it instead.")
+        return {"job_id": job_id, "deleted": True}
 
     def retry(self, job_id: str, stage: str) -> dict[str, Any]:
         if stage not in {"script", "audio", "upload", "publish", "archive"}:
@@ -147,7 +177,15 @@ class JobService:
                                  requires_reconciliation=True, safe_to_retry=False, current_operation="Reconciliation required")
             self.repo.append_event(job_id, "reconciliation_required", "Remote outcome must be reconciled before another request.")
             return self.get(job_id)
-        self.repo.update_job(job_id, status="queued", safe_to_retry=True, current_operation=f"Retrying {stage}", error_code=None, error_message=None, cancel_requested=False)
+        changes: dict[str, Any] = {
+            "status": "queued", "safe_to_retry": True, "current_operation": f"Retrying {stage}",
+            "error_code": None, "error_message": None, "cancel_requested": False,
+        }
+        if stage == "script":
+            changes["pipeline_stage"] = PipelineStage.SOURCE_DISCOVERED.value
+        elif stage == "audio":
+            changes["pipeline_stage"] = PipelineStage.SCRIPT_APPROVED.value
+        self.repo.update_job(job_id, **changes)
         self.repo.append_event(job_id, "retry_requested", f"Retry requested for {stage}")
         if self._worker: self._worker.wake()
         return self.get(job_id)
@@ -169,6 +207,103 @@ class JobService:
         lines = [f"# {script['title']}", ""]
         lines.extend(f"**{segment['speaker']}:** {segment['text']}" for segment in script["segments"])
         return "\n\n".join(lines) + "\n"
+
+    @staticmethod
+    def _remote_summary(data: dict[str, Any]) -> dict[str, Any]:
+        """Keep IDs and state, but never persist signed media URLs or tokens."""
+        return {key: data[key] for key in ("id", "title", "slug", "status", "published_at") if key in data}
+
+    def _publisher_or_error(self) -> GumuGumuClient:
+        if self.publisher is None:
+            raise APIError(503, "PUBLISHER_UNAVAILABLE", "The Gumu-Gumu publisher is not configured.")
+        return self.publisher
+
+    def create_remote_draft(self, job_id: str) -> dict[str, Any]:
+        job = self.repo.get_job(job_id)
+        if not job:
+            raise APIError(404, "NOT_FOUND", "Job not found.")
+        if job["pipeline_stage"] != PipelineStage.AUDIO_READY.value:
+            raise APIError(409, "INVALID_STATE", "A validated MP3 is required before creating a remote draft.", {"stage": job["pipeline_stage"]})
+        publisher = self._publisher_or_error()
+        audio_path = self.settings.project_path(self.settings.web.artifact_root) / job["slug"] / "podcast.mp3"
+        if not audio_path.is_file():
+            raise APIError(409, "AUDIO_NOT_READY", "The validated MP3 artifact is missing.")
+        try:
+            with audio_path.open("rb") as audio_file:
+                upload = publisher.request_path("POST", "api/v1/media/upload",
+                                                files={"file": (audio_path.name, audio_file, "audio/mpeg")})
+            if upload.status_code >= 400:
+                raise RemoteHTTPError(upload.status_code, f"Media upload failed with status {upload.status_code}.")
+            media = upload.json()
+            media_uri = media.get("uri")
+            if not isinstance(media_uri, str) or not media_uri:
+                raise RemoteHTTPError(502, "Media upload did not return a blob URI.")
+            duration_seconds = max(0, round(MP3(audio_path).info.length))
+            script = job.get("script") or {"title": job["title"], "segments": []}
+            payload = {
+                "title": script.get("title") or job["title"],
+                "slug": job["slug"],
+                "summary": job["title"][:500],
+                "description": job["title"],
+                "show_notes": self.render_script(script),
+                "transcript": self.render_script(script),
+                "explicit": False,
+                "topics": [],
+                "tags": ["podcaster-test"],
+                "audio_blob_uri": media_uri,
+                "audio_mime_type": "audio/mpeg",
+                "audio_file_size": audio_path.stat().st_size,
+                "duration_seconds": duration_seconds,
+            }
+            draft_response = publisher.request_path("POST", "api/v1/episodes", json=payload)
+            if draft_response.status_code >= 400:
+                raise RemoteHTTPError(draft_response.status_code, f"Remote draft creation failed with status {draft_response.status_code}.")
+            draft = draft_response.json()
+            remote_id = draft.get("id")
+            if not isinstance(remote_id, str) or not remote_id:
+                raise RemoteHTTPError(502, "Remote draft creation did not return an episode ID.")
+        except (OAuthError, RemoteHTTPError, OSError, ValueError) as exc:
+            raise APIError(502, "REMOTE_DRAFT_FAILED", str(exc)) from exc
+        remote = {"media": {"id": media.get("id"), "uri": media_uri, "size": media.get("size", audio_path.stat().st_size)},
+                  "draft": self._remote_summary(draft)}
+        manifest = job.get("manifest") or {}
+        manifest.update({"stage": PipelineStage.DRAFT_CREATED.value, "remote_id": remote_id})
+        atomic_json(Path(job["manifest_path"]), manifest)
+        self.repo.update_job(job_id, remote_json=remote, manifest_json=manifest,
+                             status="running", pipeline_stage=PipelineStage.DRAFT_CREATED.value,
+                             current_operation="Remote draft created", safe_to_retry=True)
+        self.repo.append_event(job_id, "draft_created", "Remote draft created", stage=PipelineStage.DRAFT_CREATED.value,
+                               payload={"remote_id": remote_id, "media_id": media.get("id")})
+        return self.get(job_id)
+
+    def publish_remote(self, job_id: str) -> dict[str, Any]:
+        job = self.repo.get_job(job_id)
+        if not job:
+            raise APIError(404, "NOT_FOUND", "Job not found.")
+        remote = job.get("remote") or {}
+        remote_id = (remote.get("draft") or {}).get("id")
+        if not remote_id:
+            raise APIError(409, "DRAFT_NOT_READY", "Create a remote draft before publishing.")
+        publisher = self._publisher_or_error()
+        try:
+            response = publisher.request_path("POST", f"api/v1/episodes/{remote_id}/publish")
+            if response.status_code >= 400:
+                raise RemoteHTTPError(response.status_code, f"Remote publish failed with status {response.status_code}.")
+            published = response.json()
+            if published.get("status") != "published":
+                raise RemoteHTTPError(502, "Remote publish did not return a published episode.")
+        except (OAuthError, RemoteHTTPError, ValueError) as exc:
+            raise APIError(502, "REMOTE_PUBLISH_FAILED", str(exc)) from exc
+        remote["published"] = self._remote_summary(published)
+        manifest = job.get("manifest") or {}
+        manifest.update({"stage": PipelineStage.PUBLISHED_VERIFIED.value, "remote_id": remote_id})
+        atomic_json(Path(job["manifest_path"]), manifest)
+        self.repo.update_job(job_id, remote_json=remote, manifest_json=manifest,
+                             status="succeeded", pipeline_stage=PipelineStage.PUBLISHED_VERIFIED.value,
+                             current_operation="Published and verified", safe_to_retry=True)
+        self.repo.append_event(job_id, "published_verified", "Remote publication verified", stage=PipelineStage.PUBLISHED_VERIFIED.value,
+                               payload={"remote_id": remote_id})
+        return self.get(job_id)
 
     def patch_script(self, job_id: str, payload: dict[str, Any], expected_revision: int) -> dict[str, Any]:
         job = self.repo.get_job(job_id)

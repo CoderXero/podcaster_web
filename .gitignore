@@ -9,3 +9,11 @@ config.yaml
 .env
 .env.*
 !.env.example
+
+# Runtime pipeline output; keep generated podcasts and job state local.
+manifests/
+podcasts/
+working/
+archive/
+published/
+logs/
